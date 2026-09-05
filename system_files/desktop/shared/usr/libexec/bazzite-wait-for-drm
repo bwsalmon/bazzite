@@ -1,0 +1,79 @@
+#!/usr/bin/bash
+# Wait for a GPU that the Wayland greeter can actually use before letting the
+# display manager start.
+#
+# The greeter's compositor asks logind for the DRM node, and logind only hands
+# out devices udev has already assigned to a seat. On a fair number of systems
+# - NVIDIA ones in particular - the GPU's card node shows up and gets tagged
+# after the display manager has been started, so every one of the greeter's
+# retries (all of which happen inside a second) fails with:
+#
+#   kwin_core: Failed to open drm node: "/dev/dri/card0"
+#   kwin_wayland_drm: No suitable DRM devices have been found
+#
+# and the machine is left on a black or corrupted screen even though the driver
+# finishes coming up moments later. Restarting the display manager by hand from
+# a TTY recovers it every time, which is what gives the race away.
+#
+# See https://github.com/ublue-os/bazzite/issues/3622
+#
+# This always exits successfully: if no GPU ever turns up we would rather let
+# the display manager start and report its own failure than hold up boot.
+
+TIMEOUT="${1:-30}"
+
+# A card node is only usable by the greeter once udev has tagged it for a seat,
+# as logind refuses to hand over anything that isn't.
+card_is_ready() {
+    local card="$1"
+    [[ -e "/dev/dri/${card}" ]] || return 1
+    udevadm info --query=property --name="/dev/dri/${card}" 2>/dev/null | \
+        grep -q "^CURRENT_TAGS=.*:master-of-seat:"
+}
+
+# Ready once any PCI display controller that has a driver bound has published a
+# seat-tagged card node. Waiting on the GPU itself rather than on "any card
+# node" matters because simpledrm is up long before the real driver is, and it
+# is not the device the greeter ends up wanting.
+gpu_is_ready() {
+    local device card saw_gpu=""
+
+    for device in /sys/bus/pci/devices/*; do
+        [[ "$(cat "${device}/class" 2>/dev/null)" == 0x03* ]] || continue
+        [[ -e "${device}/driver" ]] || continue
+        saw_gpu="yes"
+        for card in "${device}"/drm/card*; do
+            [[ -e "${card}" ]] || continue
+            card_is_ready "$(basename "${card}")" && return 0
+        done
+    done
+
+    # Nothing to wait for on machines with no driven PCI GPU (VMs, SoCs), so
+    # take whatever seat-tagged card node is there instead.
+    if [[ -z "${saw_gpu}" ]]; then
+        for card in /sys/class/drm/card*; do
+            [[ -e "${card}" ]] || continue
+            card_is_ready "$(basename "${card}")" && return 0
+        done
+    fi
+
+    return 1
+}
+
+if gpu_is_ready; then
+    exit 0
+fi
+
+echo "No seat-assigned DRM device yet, waiting up to ${TIMEOUT}s for one"
+
+# Four polls a second, so four per second of the timeout
+ATTEMPTS=$((TIMEOUT * 4))
+while ! gpu_is_ready; do
+    if ((ATTEMPTS-- <= 0)); then
+        echo "Still no seat-assigned DRM device after ${TIMEOUT}s, starting anyway"
+        exit 0
+    fi
+    sleep 0.25
+done
+
+echo "DRM device ready after ${SECONDS}s"
